@@ -1456,7 +1456,11 @@ class TestLLMClassifier:
         body = call_kwargs["proxy_server_request"]["body"]
         assert body["model"] == "haiku-classifier"
         assert body["messages"] == call_kwargs["messages"]
-        assert "explain quantum tunneling in depth" in body["messages"][0]["content"]
+        assert len(body["messages"]) == 2
+        assert body["messages"][0]["role"] == "system"
+        assert "Tiers:" in body["messages"][0]["content"]
+        assert body["messages"][1]["role"] == "user"
+        assert "explain quantum tunneling in depth" in body["messages"][1]["content"]
         assert body["response_format"]["type"] == "json_schema"
         assert body["response_format"]["json_schema"]["schema"]["properties"]["tier"]["enum"] == [
             "SIMPLE",
@@ -3340,9 +3344,7 @@ class TestEscalationKeywords:
         router = ComplexityRouter(
             model_name="test-router",
             litellm_router_instance=mock_router_instance,
-            complexity_router_config={
-                "tiers": {"SIMPLE": "shared", "COMPLEX": "shared", "REASONING": "top"}
-            },
+            complexity_router_config={"tiers": {"SIMPLE": "shared", "COMPLEX": "shared", "REASONING": "top"}},
         )
         assert router._tier_for_model("shared") == ComplexityTier.COMPLEX
         assert router._tier_for_model("top") == ComplexityTier.REASONING
@@ -3498,22 +3500,112 @@ class TestEscalationKeywords:
         )
         assert again.model == "claude-sonnet-4-20250514"  # MEDIUM bumped to COMPLEX
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "plumbing_turn",
+        [
+            pytest.param(
+                [{"type": "tool_result", "tool_use_id": "x", "content": "command output"}],
+                id="tool-result-turn",
+            ),
+            pytest.param(
+                [{"type": "text", "text": "<system-reminder>harness blob</system-reminder>"}],
+                id="reminder-only-turn",
+            ),
+            pytest.param(
+                [{"type": "text", "text": "<system-reminder>context: LITELLM ESCALATE</system-reminder>"}],
+                id="reminder-quoting-the-keyword",
+            ),
+        ],
+    )
+    async def test_plumbing_turns_do_not_re_escalate_a_pinned_session(
+        self, mock_router_instance, basic_config, plumbing_turn
+    ):
+        """A turn carrying no human ask must not count as a fresh escalate request.
+
+        Climbing a tier per explicit request and persisting the bump are both deliberate; see
+        test_escalation_overrides_session_pin_and_persists. The defect is the trigger. The last human
+        ask survives across the tool-result and reminder turns that follow it, so reading escalation
+        off it re-fires on plumbing, and because the escalated pin persists, each mid-loop turn climbs
+        another tier until the session sits on the top model and stays there. Escalation therefore
+        reads the newest turn's own ask, which is absent on these turns.
+        """
+        mock_router_instance.cache = DualCache()
+        router = ComplexityRouter(
+            model_name="test-router",
+            litellm_router_instance=mock_router_instance,
+            complexity_router_config={**basic_config, "session_affinity": True},
+        )
+        request_kwargs = self._request_kwargs("session-plumbing")
+
+        await router.async_pre_routing_hook(
+            model="test-model", request_kwargs=request_kwargs, messages=[{"role": "user", "content": "Hello!"}]
+        )
+        escalated = await router.async_pre_routing_hook(
+            model="test-model",
+            request_kwargs=request_kwargs,
+            messages=[{"role": "user", "content": "LITELLM ESCALATE"}],
+        )
+        assert escalated.model == "gpt-4o"
+
+        conversation = [
+            {"role": "user", "content": "LITELLM ESCALATE"},
+            {"role": "assistant", "content": "working on it"},
+            {"role": "user", "content": plumbing_turn},
+        ]
+        for _ in range(3):
+            mid_loop = await router.async_pre_routing_hook(
+                model="test-model", request_kwargs=request_kwargs, messages=conversation
+            )
+            assert mid_loop.model == "gpt-4o"
+
+    @pytest.mark.asyncio
+    async def test_plumbing_turns_do_not_escalate_without_session_affinity(self, mock_router_instance, basic_config):
+        """The same stale-trigger rule applies on the ordinary classification path.
+
+        There is no pin to ratchet here, so the wrong tier is stable rather than climbing, which is
+        why this needs its own coverage: the session-affinity test cannot see it. A mid-loop turn
+        still must not inherit an escalate request from a turn that was already served.
+        """
+        router = ComplexityRouter(
+            model_name="test-router",
+            litellm_router_instance=mock_router_instance,
+            complexity_router_config=basic_config,
+        )
+
+        baseline = await router.async_pre_routing_hook(
+            model="test-model", request_kwargs={}, messages=[{"role": "user", "content": "Hello there!"}]
+        )
+        assert baseline.model == "gpt-4o-mini"
+
+        mid_loop = await router.async_pre_routing_hook(
+            model="test-model",
+            request_kwargs={},
+            messages=[
+                {"role": "user", "content": "LITELLM ESCALATE Hello there!"},
+                {"role": "assistant", "content": "working on it"},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "x", "content": "output"}]},
+            ],
+        )
+        assert mid_loop.model == "gpt-4o-mini"
+
     def test_blank_escalation_keywords_are_stripped(self):
         """Blank/whitespace-only phrases are dropped so `"" in message` can't escalate
         every request; surrounding whitespace on real phrases is trimmed."""
-        assert ComplexityRouterConfig(
-            tiers={"SIMPLE": "gpt-4o-mini", "MEDIUM": "gpt-4o"},
-            escalation_keywords=["", "  "],
-        ).escalation_keywords == []
+        assert (
+            ComplexityRouterConfig(
+                tiers={"SIMPLE": "gpt-4o-mini", "MEDIUM": "gpt-4o"},
+                escalation_keywords=["", "  "],
+            ).escalation_keywords
+            == []
+        )
         assert ComplexityRouterConfig(
             tiers={"SIMPLE": "gpt-4o-mini", "MEDIUM": "gpt-4o"},
             escalation_keywords=["  LITELLM ESCALATE  ", ""],
         ).escalation_keywords == ["LITELLM ESCALATE"]
 
     @pytest.mark.asyncio
-    async def test_blank_escalation_keyword_does_not_escalate_everything(
-        self, mock_router_instance, basic_config
-    ):
+    async def test_blank_escalation_keyword_does_not_escalate_everything(self, mock_router_instance, basic_config):
         router = ComplexityRouter(
             model_name="test-router",
             litellm_router_instance=mock_router_instance,
@@ -3533,9 +3625,7 @@ class TestEscalationKeywords:
         router = ComplexityRouter(
             model_name="test-router",
             litellm_router_instance=mock_router_instance,
-            complexity_router_config={
-                "tiers": {"SIMPLE": "gpt-4o-mini", "REASONING": ["o1-a", "o1-b", "o1-c"]}
-            },
+            complexity_router_config={"tiers": {"SIMPLE": "gpt-4o-mini", "REASONING": ["o1-a", "o1-b", "o1-c"]}},
         )
         for pinned in ("o1-a", "o1-b", "o1-c"):
             assert router._escalated_pin(pinned) == pinned
@@ -3559,3 +3649,472 @@ class TestEscalationKeywords:
             messages=[{"role": "user", "content": "LITELLM ESCALATE do better"}],
         )
         assert result.model == "o1-b"  # unchanged: no random hop to o1-a / o1-c
+
+
+class TestContextAwareClassifier:
+    """Test the new classifier context window and trajectory signals."""
+
+    @pytest.mark.parametrize(
+        "tool_result_turn",
+        [
+            pytest.param(
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "x", "content": "...output..."}],
+                },
+                id="messages-surface-tool-result-block",
+            ),
+            pytest.param(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "x",
+                            "content": [{"type": "text", "text": "...output..."}],
+                        }
+                    ],
+                },
+                id="messages-surface-nested-content",
+            ),
+            pytest.param(
+                {"role": "tool", "tool_call_id": "x", "content": "...output..."},
+                id="chat-completions-surface-tool-role",
+            ),
+        ],
+    )
+    def test_extract_current_ask_skips_tool_results_on_both_request_surfaces(self, tool_result_turn):
+        """Tool output never becomes the current ask, and no tool-specific parsing is needed to get there.
+
+        This is the shape evidence for deleting that parsing. On the Messages surface tool output rides a
+        user turn as `tool_result` content blocks, which are not `type == "text"`, so the turn flattens to
+        the empty string and is skipped. On the chat-completions surface it arrives on a `tool` role, which
+        the extractor never reads. An earlier revision matched a serialized JSON payload instead, which only
+        ever fired on a hand-serialized string that neither surface produces; that check was where both
+        review rounds' findings lived, so the shapes that matter are pinned here directly.
+        """
+        from litellm.router_strategy.complexity_router.complexity_router import _extract_current_ask_and_system_prompt
+
+        messages = [
+            {"role": "user", "content": "Write a web scraper"},
+            {"role": "assistant", "content": "I'll create a scraper using BeautifulSoup..."},
+            tool_result_turn,
+        ]
+        current_ask, _ = _extract_current_ask_and_system_prompt(messages)
+        assert current_ask == "Write a web scraper"
+
+    def test_extract_current_ask_keeps_the_ask_riding_with_a_tool_result(self):
+        """A turn carrying both tool output and the human's next ask keeps the ask and drops the output.
+
+        Flattening to text parts does this for free, and it is the case a whole-message skip predicate got
+        wrong in both directions: skipping the turn would lose the ask, keeping it verbatim would feed tool
+        output to the keyword and embedding matchers that also read this string.
+        """
+        from litellm.router_strategy.complexity_router.complexity_router import _extract_current_ask_and_system_prompt
+
+        messages = [
+            {"role": "user", "content": "Write a web scraper"},
+            {"role": "assistant", "content": "Running it now"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "x", "content": "Traceback: KeyError 'href'"},
+                    {"type": "text", "text": "now make it resilient to missing attributes"},
+                ],
+            },
+        ]
+        current_ask, _ = _extract_current_ask_and_system_prompt(messages)
+        assert current_ask == "now make it resilient to missing attributes"
+        assert "Traceback" not in current_ask
+
+    def test_extract_current_ask_skips_system_reminders(self):
+        """Test that <system-reminder> blocks are skipped when finding the current ask."""
+        from litellm.router_strategy.complexity_router.complexity_router import _extract_current_ask_and_system_prompt
+
+        messages = [
+            {"role": "user", "content": "Build a REST API"},
+            {
+                "role": "assistant",
+                "content": "I can help with that",
+            },
+            {
+                "role": "user",
+                "content": "<system-reminder>This is Claude Code harness reminder text</system-reminder>",
+            },
+            {
+                "role": "user",
+                "content": "Can it handle rate limiting?",
+            },
+        ]
+        current_ask, _ = _extract_current_ask_and_system_prompt(messages)
+        assert current_ask == "Can it handle rate limiting?"
+
+    def test_extract_current_ask_keeps_prose_mentioning_reminder_tag(self):
+        """A real human question that quotes a <system-reminder> tag in prose must NOT be skipped.
+
+        The skip predicate requires the ENTIRE message to be a reminder block, not a bare tag substring,
+        so a developer asking about the harness tag is still treated as the live ask.
+        """
+        from litellm.router_strategy.complexity_router.complexity_router import _extract_current_ask_and_system_prompt
+
+        messages = [
+            {"role": "user", "content": "Set up the harness"},
+            {"role": "assistant", "content": "Done"},
+            {"role": "user", "content": "why is my <system-reminder> tag getting stripped from the output?"},
+        ]
+        current_ask, _ = _extract_current_ask_and_system_prompt(messages)
+        assert current_ask == "why is my <system-reminder> tag getting stripped from the output?"
+
+    def test_extract_prior_user_turns_excludes_current_ask(self):
+        """Prior turns are the turns BEFORE the current ask; the newest real turn (the current ask)
+        must not be duplicated into the window or it displaces the oldest requested prior turn."""
+        from litellm.router_strategy.complexity_router.complexity_router import _extract_prior_user_turns
+
+        messages = [
+            {"role": "user", "content": "First request"},
+            {"role": "assistant", "content": "First response"},
+            {"role": "user", "content": "Second request with more details and longer text"},
+            {"role": "assistant", "content": "Second response"},
+            {"role": "user", "content": "Third request is the current ask"},
+        ]
+
+        prior_turns = _extract_prior_user_turns(
+            messages, current_ask="Third request is the current ask", window_size=2, per_turn_chars=30
+        )
+
+        # "Third request..." is the current ask, so it is excluded; the two turns before it remain
+        assert len(prior_turns) == 2
+        assert prior_turns[0] == "First request"
+        assert prior_turns[1] == "Second request with more detai..."
+        assert not any("current ask" in turn for turn in prior_turns)
+
+    def test_extract_prior_user_turns_marks_truncated_turns(self):
+        """A turn cut at per_turn_chars carries a truncation marker, so the classifier can tell the
+        text was clipped rather than reading a clipped turn as a complete, abandoned thought."""
+        from litellm.router_strategy.complexity_router.complexity_router import _extract_prior_user_turns
+
+        messages = [
+            {"role": "user", "content": "x" * 500},
+            {"role": "user", "content": "short prior turn"},
+            {"role": "user", "content": "current"},
+        ]
+
+        prior_turns = _extract_prior_user_turns(messages, current_ask="current", window_size=2, per_turn_chars=20)
+
+        assert prior_turns[0] == "x" * 20 + "..."
+        assert prior_turns[1] == "short prior turn"
+
+    def test_extract_prior_user_turns_when_current_ask_is_not_newest_turn(self):
+        """`aclassify` takes `prompt` and `messages` separately, so a caller can classify something
+        other than the newest turn. The window must then keep every real turn instead of blindly
+        dropping the newest one, which would silently lose a turn of context."""
+        from litellm.router_strategy.complexity_router.complexity_router import _extract_prior_user_turns
+
+        messages = [
+            {"role": "user", "content": "turn one"},
+            {"role": "user", "content": "turn two"},
+        ]
+
+        prior_turns = _extract_prior_user_turns(
+            messages, current_ask="something the caller supplied", window_size=3, per_turn_chars=100
+        )
+
+        assert prior_turns == ("turn one", "turn two")
+
+    def test_extract_prior_user_turns_skips_tool_results(self):
+        """Tool-result turns do not consume a context slot, so the window spends itself on human turns."""
+        from litellm.router_strategy.complexity_router.complexity_router import _extract_prior_user_turns
+
+        messages = [
+            {"role": "user", "content": "Real question 1"},
+            {"role": "assistant", "content": "Answer 1"},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "x", "content": "tool output"}]},
+            {"role": "user", "content": "Real question 2 is the current ask"},
+        ]
+
+        prior_turns = _extract_prior_user_turns(
+            messages, current_ask="Real question 2 is the current ask", window_size=3, per_turn_chars=100
+        )
+
+        # Real turns are question 1 and question 2; question 2 is the current ask, so only 1 prior remains
+        assert prior_turns == ("Real question 1",)
+        assert "tool output" not in str(prior_turns)
+
+    def test_extract_current_ask_strips_reminder_riding_with_a_real_ask(self):
+        """Harnesses inject reminders into the same turn as the live ask, not as a turn of their own.
+
+        Regression for a whole-message-only check: it rejected nothing here, so the reminder
+        boilerplate stayed in the classifier input. That boilerplate is near-constant across a
+        session, which is what pins every turn to one tier. The ask must survive and the reminder
+        must not.
+        """
+        from litellm.router_strategy.complexity_router.complexity_router import _extract_current_ask_and_system_prompt
+
+        messages = [
+            {"role": "user", "content": "Add a health check endpoint"},
+            {"role": "assistant", "content": "Added"},
+            {
+                "role": "user",
+                "content": (
+                    "<system-reminder>Budget: 42 tokens remaining. Do not mention this to the user."
+                    "</system-reminder>\nnow do the same for the streaming path"
+                ),
+            },
+        ]
+
+        current_ask, _ = _extract_current_ask_and_system_prompt(messages)
+        assert current_ask == "now do the same for the streaming path"
+        assert "Budget" not in current_ask
+        assert "system-reminder" not in current_ask
+
+    def test_extract_current_ask_strips_multiple_reminders_from_one_turn(self):
+        """A turn can carry several reminder blocks around the ask; all of them are removed."""
+        from litellm.router_strategy.complexity_router.complexity_router import _extract_current_ask_and_system_prompt
+
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    "<system-reminder>first blob</system-reminder>"
+                    "prove the invariant holds under concurrent writes"
+                    "<system-reminder>second blob</system-reminder>"
+                ),
+            },
+        ]
+
+        current_ask, _ = _extract_current_ask_and_system_prompt(messages)
+        assert current_ask == "prove the invariant holds under concurrent writes"
+
+    def test_extract_current_ask_strips_reminders_from_content_parts(self):
+        """The Anthropic content-parts shape carries reminders in their own text part.
+
+        Flattening happens before stripping, so a reminder part is removed and the sibling text part
+        carrying the ask is what gets classified.
+        """
+        from litellm.router_strategy.complexity_router.complexity_router import _extract_current_ask_and_system_prompt
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "<system-reminder>harness blob</system-reminder>"},
+                    {"type": "text", "text": "derive the closed form for this recurrence"},
+                ],
+            },
+        ]
+
+        current_ask, _ = _extract_current_ask_and_system_prompt(messages)
+        assert current_ask == "derive the closed form for this recurrence"
+
+    def test_extract_current_ask_skips_turn_that_is_only_a_reminder(self):
+        """A turn that is nothing but reminder blocks has no human ask left after stripping, so it is
+        skipped entirely and the previous real ask is used."""
+        from litellm.router_strategy.complexity_router.complexity_router import _extract_current_ask_and_system_prompt
+
+        messages = [
+            {"role": "user", "content": "Explain the CAP theorem tradeoffs in our replication design"},
+            {"role": "assistant", "content": "Sure"},
+            {"role": "user", "content": "<system-reminder>only plumbing here</system-reminder>"},
+        ]
+
+        current_ask, _ = _extract_current_ask_and_system_prompt(messages)
+        assert current_ask == "Explain the CAP theorem tradeoffs in our replication design"
+
+    @pytest.mark.asyncio
+    async def test_llm_classifier_includes_prior_turns_context(self, llm_complexity_router, mock_router_instance):
+        """Test that the LLM classifier receives prior-turn context in the user message."""
+        mock_router_instance.acompletion = AsyncMock(return_value=_llm_response('{"tier": "COMPLEX"}'))
+
+        messages = [
+            {"role": "user", "content": "Design a microservice architecture"},
+            {"role": "assistant", "content": "Here's a design..."},
+            {"role": "user", "content": "How do we handle failures?"},
+        ]
+
+        await llm_complexity_router.aclassify(
+            "How do we handle failures?",
+            system_prompt="You are helpful",
+            messages=messages,
+        )
+
+        call_kwargs = mock_router_instance.acompletion.call_args.kwargs
+        messages_list = call_kwargs["messages"]
+
+        assert len(messages_list) == 2
+        assert messages_list[0]["role"] == "system"
+        system_content = messages_list[0]["content"]
+        assert "Tiers:" in system_content
+        # Caller task constraints ride in the system role so later turns never lose them
+        assert "You are helpful" in system_content
+
+        assert messages_list[1]["role"] == "user"
+        user_payload = messages_list[1]["content"]
+        assert "Recent conversation" in user_payload
+        # The prior turn is context; the current ask is what gets classified, not duplicated as a prior turn
+        assert "Design a microservice architecture" in user_payload
+        assert "How do we handle failures?" in user_payload
+        assert user_payload.count("How do we handle failures?") == 1
+        assert "Conversation so far" in user_payload
+
+    @pytest.mark.asyncio
+    async def test_llm_classifier_always_includes_system_prompt_on_later_turns(
+        self, llm_complexity_router, mock_router_instance
+    ):
+        """The caller system prompt (task constraints) must ride the system role on EVERY turn.
+
+        Regression for the earlier omit-after-turn-1 caching hack: on a deep multi-turn request,
+        the classifier must still see the caller's constraints, or it can pick the wrong tier.
+        The system role stays byte-stable across turns (rubric + constraints) so the provider can
+        still prompt-cache it; only the user payload varies.
+        """
+        mock_router_instance.acompletion = AsyncMock(return_value=_llm_response('{"tier": "MEDIUM"}'))
+
+        deep_messages = [
+            {"role": "user", "content": "Turn 1"},
+            {"role": "assistant", "content": "Response 1"},
+            {"role": "user", "content": "Turn 2"},
+            {"role": "assistant", "content": "Response 2"},
+            {"role": "user", "content": "Turn 3, the current ask"},
+        ]
+
+        await llm_complexity_router.aclassify(
+            "Turn 3, the current ask",
+            system_prompt="OUTPUT ONLY VALID JSON",
+            messages=deep_messages,
+        )
+
+        call_kwargs = mock_router_instance.acompletion.call_args.kwargs
+        system_message = call_kwargs["messages"][0]
+        assert system_message["role"] == "system"
+        assert "OUTPUT ONLY VALID JSON" in system_message["content"]
+
+    @pytest.mark.asyncio
+    async def test_prior_turns_in_multi_turn_conversation_with_tool_results(
+        self, llm_complexity_router, mock_router_instance
+    ):
+        """An agentic conversation reaches the classifier as the two human turns, not the tool traffic between
+        them. This is the end-to-end version of the shape argument: the payload is built from the same
+        messages a real Messages-surface agent loop sends, and no tool output appears in it."""
+        mock_router_instance.acompletion = AsyncMock(return_value=_llm_response('{"tier": "COMPLEX"}'))
+
+        messages = [
+            {"role": "user", "content": "Fix the login bug"},
+            {"role": "assistant", "content": "I'll analyze the code..."},
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "search", "content": "Auth flow code"}],
+            },
+            {"role": "assistant", "content": "I see the issue..."},
+            {"role": "user", "content": "Now add the token refresh logic"},
+        ]
+
+        await llm_complexity_router.aclassify(
+            "Now add the token refresh logic",
+            messages=messages,
+        )
+
+        call_kwargs = mock_router_instance.acompletion.call_args.kwargs
+        user_payload = call_kwargs["messages"][1]["content"]
+
+        assert "Fix the login bug" in user_payload
+        assert "Now add the token refresh logic" in user_payload
+        assert "tool_result" not in user_payload
+        assert "Auth flow code" not in user_payload
+
+    @pytest.mark.asyncio
+    async def test_trajectory_signal_counts_content_parts_not_just_strings(
+        self, llm_complexity_router, mock_router_instance
+    ):
+        """The trajectory line must measure content-parts requests, not report them as empty.
+
+        Regression for a string-only guard on message content: Anthropic-style callers send content
+        as a list of parts, so every message counted as zero and the classifier was told
+        "~0 tokens" for a deep conversation. A fabricated depth signal is worse than none, because
+        it argues for a cheaper tier on exactly the requests that need an expensive one.
+        """
+        mock_router_instance.acompletion = AsyncMock(return_value=_llm_response('{"tier": "COMPLEX"}'))
+
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": "a" * 400}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "b" * 400}]},
+            {"role": "user", "content": [{"type": "text", "text": "and now the hard part"}]},
+        ]
+
+        await llm_complexity_router.aclassify("and now the hard part", messages=messages)
+
+        user_payload = mock_router_instance.acompletion.call_args.kwargs["messages"][1]["content"]
+        trajectory_line = next(line for line in user_payload.splitlines() if "Conversation so far" in line)
+        reported_tokens = int(trajectory_line.split("~")[1].split(" ")[0])
+        assert reported_tokens >= 200
+
+    @pytest.mark.asyncio
+    async def test_no_trajectory_signal_when_request_had_no_messages(
+        self, llm_complexity_router, mock_router_instance
+    ):
+        """On the prompt-only path there is no conversation to measure, so the depth line is omitted
+        rather than asserting a false "~0 tokens" to the classifier."""
+        mock_router_instance.acompletion = AsyncMock(return_value=_llm_response('{"tier": "SIMPLE"}'))
+
+        await llm_complexity_router.aclassify("what is 2+2")
+
+        user_payload = mock_router_instance.acompletion.call_args.kwargs["messages"][1]["content"]
+        assert "Conversation so far" not in user_payload
+        assert "what is 2+2" in user_payload
+
+    @pytest.mark.asyncio
+    async def test_single_turn_request_sends_no_conversation_context(
+        self, llm_complexity_router, mock_router_instance
+    ):
+        """A single-turn request carries no conversation, so the classifier sees only the ask.
+
+        Found in QA. The depth line keyed off `messages` being non-empty rather than off there being
+        prior conversation, so every request that arrived with a messages array picked up a
+        "Conversation so far" line, including the single-turn case that is supposed to be unchanged
+        from before this feature. The reported number was the size of the ask itself presented as
+        conversation history.
+        """
+        mock_router_instance.acompletion = AsyncMock(return_value=_llm_response('{"tier": "SIMPLE"}'))
+
+        await llm_complexity_router.aclassify("what is 2+2", messages=[{"role": "user", "content": "what is 2+2"}])
+
+        user_payload = mock_router_instance.acompletion.call_args.kwargs["messages"][1]["content"]
+        assert "Conversation so far" not in user_payload
+        assert "Recent conversation" not in user_payload
+        assert user_payload.strip() == "Classify this message:\nwhat is 2+2"
+
+    @pytest.mark.asyncio
+    async def test_window_size_zero_sends_nothing_about_the_conversation(self, mock_router_instance):
+        """`classifier_context_window_size: 0` is a contract: nothing about the conversation leaves
+        the proxy beyond the current ask.
+
+        Found in QA. Zero suppressed the prior-turn block but not the depth line, so a deep
+        conversation still leaked its size to the classifier model, which the field description and
+        the review thread both said it would not. Asserted on a multi-turn request, since the
+        single-turn case passes even when the switch is ignored.
+        """
+        router = ComplexityRouter(
+            model_name="test-router",
+            litellm_router_instance=mock_router_instance,
+            complexity_router_config={
+                "tiers": {"SIMPLE": "gpt-4o-mini", "COMPLEX": "claude-sonnet-4-20250514"},
+                "classifier_type": "llm",
+                "classifier_llm_config": {"model": "haiku-classifier"},
+                "classifier_context_window_size": 0,
+            },
+        )
+        mock_router_instance.acompletion = AsyncMock(return_value=_llm_response('{"tier": "SIMPLE"}'))
+
+        await router.aclassify(
+            "what is 2+2",
+            messages=[
+                {"role": "user", "content": "design the sharding strategy for the write path"},
+                {"role": "assistant", "content": "here is a design"},
+                {"role": "user", "content": "what is 2+2"},
+            ],
+        )
+
+        user_payload = mock_router_instance.acompletion.call_args.kwargs["messages"][1]["content"]
+        assert "Conversation so far" not in user_payload
+        assert "Recent conversation" not in user_payload
+        assert "sharding strategy" not in user_payload
+        assert user_payload.strip() == "Classify this message:\nwhat is 2+2"

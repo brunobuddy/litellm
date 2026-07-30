@@ -18,7 +18,8 @@ from __future__ import annotations
 import asyncio
 import random
 import re
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping, Sequence
+from itertools import islice
 from typing import TYPE_CHECKING, Any, Literal, Union, cast
 
 from pydantic import BaseModel
@@ -58,7 +59,7 @@ class TierClassification(BaseModel):
     tier: Literal["SIMPLE", "MEDIUM", "COMPLEX", "REASONING"]
 
 
-_CLASSIFICATION_PROMPT_TEMPLATE = """Classify the complexity of the following user request into exactly one tier.
+_CLASSIFICATION_SYSTEM_RUBRIC = """Classify the complexity of a user request into exactly one tier.
 
 Judge the intellectual difficulty of answering correctly, not how short the request is.
 
@@ -68,8 +69,7 @@ Tiers:
 - COMPLEX: non-trivial code, architecture, multi-step technical work, or specialized domain depth.
 - REASONING: open-ended analysis, proofs, famous hard problems, step-by-step reasoning, tradeoffs, or anything where a correct answer requires careful thought rather than a quick lookup.
 
-{system_context}Request:
-{prompt}"""
+You may also be given the caller's own system prompt (task constraints) and a few prior user turns for context only. Classify only the current message; use any other section present to disambiguate its difficulty."""
 
 
 def _append_custom_keywords(base_keywords: list[str], custom_keywords: list[str] | None) -> list[str]:
@@ -122,6 +122,115 @@ def _effective_turn_off_message_logging(request_kwargs: Mapping[str, Any] | None
     return initialize_standard_callback_dynamic_params(dict(request_kwargs) if request_kwargs else {}).get(
         "turn_off_message_logging"
     )
+
+
+_SYSTEM_REMINDER_BLOCK = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL | re.IGNORECASE)
+
+_TRUNCATION_MARKER = "..."
+
+
+def _message_text(content: object) -> str:
+    """
+    Flatten a message's content field to plain text, joining multi-part text blocks.
+
+    Keeping only `type == "text"` parts is what makes tool-result turns disappear without any
+    tool-specific handling: on the Messages surface tool output rides a user turn as `tool_result`
+    content blocks, which are not text parts, so such a turn flattens to the empty string and the
+    callers below skip it. On the chat-completions surface tool output arrives on a `tool` role,
+    which those callers never read. Neither surface needs the payload inspected.
+    """
+    if isinstance(content, list):
+        parts = tuple(part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") == "text")
+        return " ".join(parts).strip()
+    return content if isinstance(content, str) else ""
+
+
+def _human_text(content: object) -> str:
+    """
+    Flatten a message's content to the text a human actually wrote, with harness reminders removed.
+
+    Reminders are the noise that survives flattening, because harnesses inject
+    `<system-reminder>...</system-reminder>` as ordinary text, often alongside the live ask rather
+    than as a turn of their own. Rejecting any turn containing one would throw away the ask riding
+    with it, and keeping it would feed the classifier near-constant boilerplate that pins every turn
+    of a session to one tier. So complete reminder blocks are stripped and whatever the human wrote
+    survives.
+
+    A reminder tag mentioned in prose without its closing tag is not a block and is left intact, so
+    "why is my <system-reminder> tag stripped?" stays classifiable as the real ask it is.
+    """
+    return _SYSTEM_REMINDER_BLOCK.sub(" ", _message_text(content)).strip()
+
+
+def _iter_human_asks_newest_first(messages: Sequence[Mapping[str, object]]) -> Iterator[str]:
+    """Yield user-turn texts that carry a real human ask, newest first, with harness noise removed."""
+    return (
+        text for msg in reversed(messages) if msg.get("role") == "user" and (text := _human_text(msg.get("content")))
+    )
+
+
+def _newest_turn_ask(messages: Sequence[Mapping[str, object]]) -> str | None:
+    """
+    The human ask on the newest user turn, or None when that turn carries only plumbing.
+
+    Escalation keys off this rather than off the last human ask in history. The last human ask
+    survives across every tool-result and reminder turn that follows it, so re-reading it on those
+    turns treats one explicit escalate request as a fresh request per plumbing turn. Under session
+    affinity the escalated pin is persisted deliberately and a further request climbs another tier,
+    so a stale trigger would walk a session to the top tier without anyone asking again.
+    """
+    newest_user_turn = next((msg for msg in reversed(messages) if msg.get("role") == "user"), None)
+    if newest_user_turn is None:
+        return None
+    return _human_text(newest_user_turn.get("content")) or None
+
+
+def _extract_current_ask_and_system_prompt(
+    messages: Sequence[Mapping[str, object]],
+) -> tuple[str | None, str | None]:
+    """
+    Extract the last real human ask and the last system prompt from messages.
+
+    Distinguishes the "current ask" from the "last message", which mid-agentic-loop is a harness
+    reminder rather than anything a human typed. Both are None if not found.
+    """
+    current_ask = next(_iter_human_asks_newest_first(messages), None)
+    system_prompt = next(
+        (
+            text
+            for msg in reversed(messages)
+            if msg.get("role") == "system" and (text := _message_text(msg.get("content")))
+        ),
+        None,
+    )
+    return current_ask, system_prompt
+
+
+def _truncate(text: str, limit: int) -> str:
+    """Cap text at limit characters, marking it so the classifier can tell the turn was cut short."""
+    return text if len(text) <= limit else f"{text[:limit]}{_TRUNCATION_MARKER}"
+
+
+def _extract_prior_user_turns(
+    messages: Sequence[Mapping[str, object]],
+    current_ask: str | None,
+    window_size: int,
+    per_turn_chars: int,
+) -> tuple[str, ...]:
+    """
+    Extract up to window_size human asks that come BEFORE current_ask, oldest first.
+
+    The current ask is classified on its own, so including it here would duplicate it in the payload
+    and displace the oldest prior turn. It is excluded by matching current_ask rather than by
+    dropping the newest turn positionally, so a caller that classifies something other than the
+    newest turn still gets a correct window.
+    """
+    if window_size <= 0 or not messages:
+        return ()
+
+    newest_first = tuple(islice(_iter_human_asks_newest_first(messages), window_size + 1))
+    prior = newest_first[1:] if newest_first[:1] == (current_ask,) else newest_first[:window_size]
+    return tuple(_truncate(turn, per_turn_chars) for turn in reversed(prior))
 
 
 class DimensionScore:
@@ -402,6 +511,7 @@ class ComplexityRouter(CustomLogger):
         prompt: str,
         system_prompt: str | None = None,
         request_kwargs: dict[str, Any] | None = None,
+        messages: Sequence[Mapping[str, object]] | None = None,
     ) -> tuple[ComplexityTier, float, list[str]]:
         """
         Classify a prompt by complexity, using the LLM classifier when configured.
@@ -413,7 +523,7 @@ class ComplexityRouter(CustomLogger):
             return self.classify(prompt, system_prompt)
 
         try:
-            tier = await self._classify_with_llm(prompt, system_prompt, request_kwargs)
+            tier = await self._classify_with_llm(prompt, system_prompt, request_kwargs, messages)
             return tier, 1.0, [f"llm-classifier:{tier.value}"]
         except Exception as e:  # noqa: BLE001 -- external LLM call can fail in many distinct ways (timeout, provider error, validation, parse error); any failure must fall back to the heuristic scorer
             verbose_router_logger.warning(
@@ -426,34 +536,72 @@ class ComplexityRouter(CustomLogger):
         prompt: str,
         system_prompt: str | None = None,
         request_kwargs: dict[str, Any] | None = None,
+        messages: Sequence[Mapping[str, object]] | None = None,
     ) -> ComplexityTier:
-        """Call the configured classifier model and parse its structured tier response."""
+        """
+        Call the configured classifier model with a system/user role split and prior-turn context.
+
+        Builds a structured classification prompt with:
+        - System message: the stable classifier rubric AND the caller's own system prompt (task
+          constraints). This is the largest, most repeated part of the call, so keeping it in the
+          system role lets the provider prompt-cache it across a session's classifier calls.
+        - User message: the variable payload -- a few prior user turns for context and the current
+          ask to classify.
+
+        Args:
+            prompt: The current user ask text (already extracted as the real human ask, not tool results)
+            system_prompt: The caller's system prompt (task constraints), always included so later
+                turns never lose it
+            request_kwargs: Request metadata for spend attribution
+            messages: Full message history for extracting prior turns and the trajectory signal
+        """
         llm_config = self.config.classifier_llm_config
         if llm_config is None:
             raise ValueError("classifier_llm_config is not set")
 
-        system_context = f"Context: {system_prompt}\n\n" if system_prompt else ""
-        classification_prompt = _CLASSIFICATION_PROMPT_TEMPLATE.format(system_context=system_context, prompt=prompt)
+        system_rubric = (
+            f"{_CLASSIFICATION_SYSTEM_RUBRIC}\n\nCaller system prompt (task constraints):\n{system_prompt}"
+            if system_prompt
+            else _CLASSIFICATION_SYSTEM_RUBRIC
+        )
 
-        # Forward the original request's metadata so the classifier call's spend is
-        # attributed to the calling key/team instead of being dropped. Excludes the
-        # parent request's budget reservation, which the routed completion (not this
-        # internal classifier call) is responsible for reconciling.
+        prior_turns = (
+            _extract_prior_user_turns(
+                messages,
+                current_ask=prompt,
+                window_size=self.config.classifier_context_window_size,
+                per_turn_chars=self.config.classifier_context_per_turn_chars,
+            )
+            if messages and self.config.classifier_context_window_size > 0
+            else ()
+        )
+
+        user_payload = self._build_classifier_user_payload(
+            prompt=prompt,
+            prior_turns=prior_turns,
+            messages=messages,
+        )
+
         request_metadata = (request_kwargs or {}).get("litellm_metadata") or (request_kwargs or {}).get("metadata")
         metadata = _classifier_call_metadata(request_metadata)
         turn_off_message_logging = _effective_turn_off_message_logging(request_kwargs)
 
+        messages_for_call = [
+            {"role": "system", "content": system_rubric},
+            {"role": "user", "content": user_payload},
+        ]
+
         proxy_server_request = {
             "body": {
                 "model": llm_config.model,
-                "messages": [{"role": "user", "content": classification_prompt}],
+                "messages": messages_for_call,
                 "response_format": type_to_response_format_param(TierClassification),
             }
         }
 
         response: ModelResponse = await self.litellm_router_instance.acompletion(
             model=llm_config.model,
-            messages=[{"role": "user", "content": classification_prompt}],
+            messages=messages_for_call,
             response_format=TierClassification,
             timeout=llm_config.timeout_ms / 1000,
             metadata=metadata,
@@ -465,6 +613,48 @@ class ComplexityRouter(CustomLogger):
             raise ValueError("LLM classifier returned empty content")
         result = TierClassification.model_validate_json(content)
         return ComplexityTier[result.tier]
+
+    @staticmethod
+    def _build_classifier_user_payload(
+        prompt: str,
+        prior_turns: Sequence[str] | None = None,
+        messages: Sequence[Mapping[str, object]] | None = None,
+    ) -> str:
+        """
+        Build the user message payload for the LLM classifier.
+
+        Structures prior-turn context, a trajectory signal (how deep into the conversation this
+        request is), and the current ask so the classifier can disambiguate the request's
+        difficulty. The caller's system prompt is not repeated here; it lives in the system role.
+
+        The trajectory signal is conversation context, so it rides the same switch as the prior-turn
+        window rather than keying off `messages` being non-empty. Two cases turn on that: with the
+        window disabled the classifier must see nothing about the conversation beyond the current
+        ask, which is the contract `classifier_context_window_size: 0` advertises; and on a
+        single-turn request there is no prior conversation to describe, so a depth line would report
+        the size of the ask itself as though it were history.
+        """
+        prior_turns_block = (
+            (
+                "\nRecent conversation (context only, do not classify these):",
+                *(f"[{i}] {turn}" for i, turn in enumerate(prior_turns, start=1)),
+            )
+            if prior_turns
+            else ()
+        )
+
+        cumulative_tokens = sum(len(_message_text(msg.get("content"))) // 4 for msg in messages or ())
+        trajectory_block = (
+            (f"\nConversation so far: ~{cumulative_tokens} tokens across the request",) if prior_turns else ()
+        )
+
+        parts = (
+            prior_turns_block,
+            trajectory_block,
+            (f"\nClassify this message:\n{prompt}",),
+        )
+
+        return "\n".join(part for group in parts for part in group)
 
     def get_model_for_tier(self, tier: ComplexityTier) -> str:
         """
@@ -907,27 +1097,13 @@ class ComplexityRouter(CustomLogger):
     def _extract_user_message_and_system_prompt(
         messages: list[dict[str, Any]],
     ) -> tuple[str | None, str | None]:
-        """Extract the last user message text and last system prompt from messages."""
-        user_message: str | None = None
-        system_prompt: str | None = None
+        """
+        Deprecated: use _extract_current_ask_and_system_prompt instead.
 
-        for msg in reversed(messages):
-            role = msg.get("role", "")
-            content = msg.get("content") or ""
-            if isinstance(content, list):
-                text_parts = [
-                    part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") == "text"
-                ]
-                content = " ".join(text_parts).strip()
-            if isinstance(content, str) and content:
-                if role == "user" and user_message is None:
-                    user_message = content
-                elif role == "system" and system_prompt is None:
-                    system_prompt = content
-            if user_message is not None and system_prompt is not None:
-                break
-
-        return user_message, system_prompt
+        Kept for backward compatibility. Returns the last real user ask (skipping tool results
+        and harness messages) and the last system prompt.
+        """
+        return _extract_current_ask_and_system_prompt(messages)
 
     @staticmethod
     def _iter_metadata_dicts(request_kwargs: dict) -> list[dict]:
@@ -1005,11 +1181,7 @@ class ComplexityRouter(CustomLogger):
                 routed_model: str | None = pinned_model
                 if self.escalation_keywords:
                     resolved_messages = self._resolve_messages(messages, request_kwargs)
-                    user_message = (
-                        self._extract_user_message_and_system_prompt(resolved_messages)[0]
-                        if resolved_messages
-                        else None
-                    )
+                    user_message = _newest_turn_ask(resolved_messages) if resolved_messages else None
                     if user_message is not None and self._escalation_triggered(user_message):
                         routed_model = self._escalated_pin(pinned_model)
                 if routed_model is not None:
@@ -1087,7 +1259,7 @@ class ComplexityRouter(CustomLogger):
         # Determine whether the original request used messages directly
         has_original_messages = messages is not None and len(messages) > 0
 
-        user_message, system_prompt = self._extract_user_message_and_system_prompt(resolved_messages)
+        user_message, system_prompt = _extract_current_ask_and_system_prompt(resolved_messages)
 
         if user_message is None:
             verbose_router_logger.debug("ComplexityRouter: No user message found, routing to default model")
@@ -1108,7 +1280,8 @@ class ComplexityRouter(CustomLogger):
                 messages=messages if has_original_messages else None,
             )
 
-        escalate = self._escalation_triggered(user_message)
+        newest_ask = _newest_turn_ask(resolved_messages)
+        escalate = newest_ask is not None and self._escalation_triggered(newest_ask)
 
         override_tier = await self._resolve_keyword_tier_override(user_message, request_kwargs)
         if override_tier is not None:
@@ -1125,7 +1298,7 @@ class ComplexityRouter(CustomLogger):
                 messages=messages if has_original_messages else None,
             )
 
-        tier, score, signals = await self.aclassify(user_message, system_prompt, request_kwargs)
+        tier, score, signals = await self.aclassify(user_message, system_prompt, request_kwargs, resolved_messages)
         if escalate:
             tier = self._escalate_tier(tier)
             signals = [*signals, "escalation"]
